@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import datetime
+import os
 import uuid
 
 from bleak.backends.characteristic import BleakGATTCharacteristic
@@ -20,6 +22,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.util import dt as dt_util
 
 from .const import (
     DOMAIN,
@@ -33,9 +36,59 @@ from .const import (
     ConnectionTimeout,
     NoConnectableBluetoothAdapter,
     TIMEOUT_SECONDS,
+    CMD_HEARTBEAT,
+    CMD_STOP,
+    CMD_BATTERY_STATUS,
+    CMD_SPEED_STANDARD,
+    CMD_SPEED_COMFORT,
+    CMD_SPEED_SLOW,
+    CMD_LIMITS_INIT_2,
+    CMD_LIMITS_STEP_UP,
+    CMD_LIMITS_STEP_DOWN,
+    CMD_LIMITS_MOVE_UP,
+    CMD_LIMITS_MOVE_DOWN,
+    CMD_LIMITS_SET,
+    CMD_TIMER_REQUEST,
+    CMD_TIMER_DELETE_BASE,
+    CMD_TIMER_RESET,
+    CMD_BLIND_REACTIVATE,
+    CMD_TIMESTAMP_BASE,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+_BLIND_EVENT_LOG = "/config/blind_events.jsonl"
+_BLIND_EVENT_MAX_BYTES = 5 * 1024 * 1024  # rotate at 5 MB
+
+
+def _write_blind_event_sync(line: str) -> None:
+    """Blocking write — must be called from an executor, not the event loop."""
+    try:
+        try:
+            if os.path.getsize(_BLIND_EVENT_LOG) > _BLIND_EVENT_MAX_BYTES:
+                os.replace(_BLIND_EVENT_LOG, _BLIND_EVENT_LOG + ".bak")
+        except OSError:
+            pass
+        with open(_BLIND_EVENT_LOG, "a") as f:
+            f.write(line)
+    except Exception:
+        pass
+
+
+async def _log_blind_event(blind_name: str, event_type: str, **kwargs) -> None:
+    """Append a structured event to the blind events log. Never raises."""
+    try:
+        entry = {
+            "ts": dt_util.now().isoformat(),
+            "blind": blind_name,
+            "event": event_type,
+            **kwargs,
+        }
+        line = json.dumps(entry) + "\n"
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _write_blind_event_sync, line)
+    except Exception:
+        pass
 
 
 class Hub:
@@ -103,6 +156,8 @@ class TuissBlind:
         # Battery check configuration
         self._battery_check_days: int = 0
         self._last_battery_check: datetime.datetime | None = None
+        # Raw BLE battery readings for protocol analysis (capped at 100, survives until restart)
+        self._battery_raw_readings: list[dict] = []
         self.timers = {}
         self._store = Store(self.hub._hass, 1, f"tuiss2ha_{self.host.replace(':', '').lower()}_schedules")
         self._limits_heartbeat_task: asyncio.Task | None = None
@@ -189,6 +244,7 @@ class TuissBlind:
 
             # If the client is connected, return early
             if self._client and self._client.is_connected:
+                await _log_blind_event(self.name, "connection_success", attempt=retry_count)
                 return
 
             retry_count += 1
@@ -203,6 +259,7 @@ class TuissBlind:
             self._restart_attempts,
             last_err,
         )
+        await _log_blind_event(self.name, "connection_failure", attempts=self._restart_attempts, error=last_err)
         # Give a clear error when user has only passive Bluetooth (e.g. Shelly)
         if last_err and (
             "passive-only" in last_err.lower()
@@ -324,7 +381,7 @@ class TuissBlind:
     async def stop(self) -> None:
         """Stop the blind at current position."""
         _LOGGER.debug("%s: Attempting to stop the blind.", self.name)
-        command = bytes.fromhex("ff78ea415f0301")
+        command = bytes.fromhex(CMD_STOP)
 
         # skip if the blind is not moving
         if self._moving == 0:
@@ -346,12 +403,18 @@ class TuissBlind:
         _LOGGER.debug("%s: Attempting to set the blind speed", self.name)
         match self._blind_speed:
             case "Standard":
-                command = bytes.fromhex("ff78ea41f202")
+                command = bytes.fromhex(CMD_SPEED_STANDARD)
             case "Comfort":
-                command = bytes.fromhex("ff78ea41f201")
+                command = bytes.fromhex(CMD_SPEED_COMFORT)
             case "Slow":
-                command = bytes.fromhex("ff78ea41f200")
-
+                command = bytes.fromhex(CMD_SPEED_SLOW)
+            case _:
+                _LOGGER.warning(
+                    "%s: Cannot set speed — unrecognised value %r",
+                    self.name,
+                    self._blind_speed,
+                )
+                return
 
         await self.ensure_connected()
         
@@ -394,9 +457,8 @@ class TuissBlind:
                 notify_started = True
             except BleakError as retry_error:
                 _LOGGER.warning("%s: Could not establish notifications: %s", self.name, retry_error)
-                # Characteristic may not exist or device disconnected; ensure cleanup
                 await self.disconnect()
-                return
+                raise HomeAssistantError(f"{self.name}: Could not establish BLE notifications — characteristic not found") from retry_error
 
         # Only send command if we successfully started notifications and are still connected
         if notify_started and self._client and self._client.is_connected:
@@ -405,7 +467,7 @@ class TuissBlind:
             except Exception as e:
                 _LOGGER.error("%s: Error sending command during get_from_blind: %s", self.name, e)
                 await self.disconnect()
-                return
+                raise HomeAssistantError(f"{self.name}: BLE send failed — {e}") from e
 
             # Wait for the response/callback to complete with timeout to prevent hanging
             if self._client:
@@ -423,12 +485,13 @@ class TuissBlind:
 
     async def get_battery_status(self) -> None:
         """Get the battery state from the blind as good or bad."""
-        command = bytes.fromhex("ff78ea41f00301")
+        command = bytes.fromhex(CMD_BATTERY_STATUS)
         await self.get_from_blind(command, self.battery_callback)
 
 
     async def get_blind_position(self) -> None:
         """Get the current position of the blind."""
+        await _log_blind_event(self.name, "position_query")
         command = bytes.fromhex(INITIALIZATION_MESSAGE)
         await self.get_from_blind(command, self.position_callback)
 
@@ -453,7 +516,7 @@ class TuissBlind:
 
     async def limits_heartbeat_loop(self, move_command_str: str) -> None:
         """Send heartbeat every 4 seconds while moving."""
-        heartbeat_command = bytes.fromhex("ff010101010101")
+        heartbeat_command = bytes.fromhex(CMD_HEARTBEAT)
         move_command = bytes.fromhex(move_command_str)
         while True:
             try:
@@ -480,7 +543,7 @@ class TuissBlind:
         # Set the initialisation commands
         _LOGGER.debug("Sending initialisation commands")
         await self.send_command(UUID, bytes.fromhex(INITIALIZATION_MESSAGE))
-        await self.send_command(UUID, bytes.fromhex("ff78ea41210301"))
+        await self.send_command(UUID, bytes.fromhex(CMD_LIMITS_INIT_2))
     
 
     async def limits_step_up(self) -> None:
@@ -491,7 +554,7 @@ class TuissBlind:
             _LOGGER.debug("Connection lost, limits set up failed")
         
         _LOGGER.debug("Stepping up")
-        await self.send_command(UUID, bytes.fromhex("ff78ea41220301"))    
+        await self.send_command(UUID, bytes.fromhex(CMD_LIMITS_STEP_UP))    
         
 
     async def limits_step_down(self) -> None:
@@ -502,7 +565,7 @@ class TuissBlind:
             _LOGGER.debug("Connection lost, limits set up failed")
         
         _LOGGER.debug("Stepping down")
-        await self.send_command(UUID, bytes.fromhex("ff78ea41230301"))
+        await self.send_command(UUID, bytes.fromhex(CMD_LIMITS_STEP_DOWN))
 
 
     async def limits_move_up(self) -> None:
@@ -512,7 +575,7 @@ class TuissBlind:
             _LOGGER.debug("Connection lost, limits set up failed")
         
         _LOGGER.debug("Moving up")
-        move_command = "ff78ea41cf0301"
+        move_command = CMD_LIMITS_MOVE_UP
         await self.send_command(UUID, bytes.fromhex(move_command))
         self.limits_heartbeat_start(move_command)
 
@@ -524,7 +587,7 @@ class TuissBlind:
             _LOGGER.debug("Connection lost, limits set up failed")  
         
         _LOGGER.debug("Moving down")
-        move_command = "ff78ea411f0301"
+        move_command = CMD_LIMITS_MOVE_DOWN
         await self.send_command(UUID, bytes.fromhex(move_command))
         self.limits_heartbeat_start(move_command)
         
@@ -537,7 +600,7 @@ class TuissBlind:
             _LOGGER.debug("Connection lost, limits set up failed")  
         
         _LOGGER.debug("Stopping movement")
-        await self.send_command(UUID, bytes.fromhex("ff78ea415f0301"))
+        await self.send_command(UUID, bytes.fromhex(CMD_STOP))
         
         
     async def limits_set(self) -> None:
@@ -548,8 +611,8 @@ class TuissBlind:
             _LOGGER.debug("Connection lost, limits set up failed")
         
         _LOGGER.debug("Setting the limit")
-        await self.send_command(UUID, bytes.fromhex("ff78ea415f0301"))
-        await self.send_command(UUID, bytes.fromhex("ff78ea41410301"))
+        await self.send_command(UUID, bytes.fromhex(CMD_STOP))
+        await self.send_command(UUID, bytes.fromhex(CMD_LIMITS_SET))
 
     ##################################################################################################
     ## TIMER METHODS #################################################################################
@@ -591,7 +654,7 @@ class TuissBlind:
 
         await self.send_command(UUID, bytes.fromhex(CONNECTION_MESSAGE))   
         await self.send_timestamp()   
-        await self.send_command(UUID, bytes.fromhex("ff78ea4104"))   
+        await self.send_command(UUID, bytes.fromhex(CMD_TIMER_REQUEST))   
         
         try:
             await asyncio.wait_for(timer_id_event.wait(), timeout=10.0)
@@ -622,7 +685,7 @@ class TuissBlind:
         timer_command = self.create_timer_command(timer_id, days, time_str, position)
         
         await self.send_command(UUID, bytes.fromhex(timer_command))   
-        await self.send_command(UUID, bytes.fromhex("ff78ea41f00301"))
+        await self.send_command(UUID, bytes.fromhex(CMD_BATTERY_STATUS))
         await self.disconnect()       
         
         existing_ha_indices = {t.get("ha_index") for t in self.timers.values() if "ha_index" in t}
@@ -650,9 +713,9 @@ class TuissBlind:
         await self.send_command(UUID, bytes.fromhex(CONNECTION_MESSAGE))
         await self.send_timestamp()      
         await self.send_command(UUID, bytes.fromhex(INITIALIZATION_MESSAGE))
-        delete_hex = f"ff78ea410301{int(timer_id):02x}" #schedule index in hex, convert from string to int to hex
+        delete_hex = f"{CMD_TIMER_DELETE_BASE}{int(timer_id):02x}" #schedule index in hex, convert from string to int to hex
         await self.send_command(UUID, bytes.fromhex(delete_hex))
-        await self.send_command(UUID, bytes.fromhex("ff78ea41f00301"))
+        await self.send_command(UUID, bytes.fromhex(CMD_BATTERY_STATUS))
         await self.disconnect()
         
         if timer_id in self.timers:
@@ -672,13 +735,13 @@ class TuissBlind:
         await self.send_command(UUID, bytes.fromhex(CONNECTION_MESSAGE))
         await self.send_timestamp()
         await self.send_command(UUID, bytes.fromhex(INITIALIZATION_MESSAGE))
-        await self.send_command(UUID, bytes.fromhex("ff04040404")) # reset command
+        await self.send_command(UUID, bytes.fromhex(CMD_TIMER_RESET)) # reset command
         
         await self.disconnect()
         
         # Reconnect to the blind to ensure it's back online after reset
         await self.attempt_connection()
-        await self.send_command(UUID, bytes.fromhex("ff02020202787878787878")) # reactivate blind
+        await self.send_command(UUID, bytes.fromhex(CMD_BLIND_REACTIVATE)) # reactivate blind
         await self.disconnect()
          
         #remove any timer entities
@@ -733,28 +796,52 @@ class TuissBlind:
 
     async def battery_callback(self, sender: BleakGATTCharacteristic, data: bytearray):
         """Wait for response from the blind and updates entity status."""
-        _LOGGER.debug("%s: Attempting to get battery status from response %s", self.name, data.hex())
-
         decimals = self.split_data(data)
+        # WARNING so raw bytes are always visible in HA's log — helps build a
+        # dataset to understand the BLE protocol across firmware/charge states.
+        _LOGGER.warning("%s: battery_callback raw decimals (len=%d): %s", self.name, len(decimals), decimals)
 
-        if decimals[4] == 210:
-            if len(decimals) == 7 or decimals[5] >= 10:
-                _LOGGER.debug(
-                    "%s: Please charge device", self.name
-                )  # think its based on the length of the response? ff010203d2 (bad) vs ff010203d202e803 (good)
+        # Record every invocation regardless of discriminator match, for analysis.
+        matched = len(decimals) > 4 and decimals[4] in (2, 210)
+        reading = {
+            "ts": dt_util.now().isoformat(),
+            "data": decimals,
+            "d4": decimals[4] if len(decimals) > 4 else None,
+            "d5": decimals[5] if len(decimals) > 5 else None,
+            "matched": matched,
+        }
+        self._battery_raw_readings.append(reading)
+        if len(self._battery_raw_readings) > 100:
+            self._battery_raw_readings = self._battery_raw_readings[-100:]
+
+        if matched:
+            if len(decimals) < 6:
+                _LOGGER.debug("%s: Battery response too short to read level — assuming low", self.name)
                 self._battery_status = True
-            elif decimals[5] < 10:
-                _LOGGER.debug("%s: Battery is good", self.name)
-                self._battery_status = False
+            elif decimals[5] >= 10:
+                _LOGGER.debug("%s: Battery low (decimals[5]=%d >= 10)", self.name, decimals[5])
+                self._battery_status = True
             else:
-                _LOGGER.debug("%s: Battery logic is wrong", self.name)
-                self._battery_status = None
+                _LOGGER.debug("%s: Battery good (decimals[5]=%d < 10)", self.name, decimals[5])
+                self._battery_status = False
             # Record time of this battery check
             try:
-                self._last_battery_check = datetime.datetime.now()
+                self._last_battery_check = dt_util.now()
             except Exception:
                 self._last_battery_check = None
+            await _log_blind_event(
+                self.name, "battery_read",
+                low=self._battery_status,
+                d4=decimals[4] if len(decimals) > 4 else None,
+                d5=decimals[5] if len(decimals) > 5 else None,
+            )
             self._stopped_event.set()
+        else:
+            _LOGGER.debug(
+                "%s: battery_callback — decimals[4]=%s not in known discriminators (2, 210); skipping parse",
+                self.name,
+                decimals[4] if len(decimals) > 4 else "N/A",
+            )
 
     async def position_callback(self, sender: BleakGATTCharacteristic, data: bytearray):
         """Wait for response from the blind and updates entity status."""
@@ -762,9 +849,20 @@ class TuissBlind:
 
         decimals = self.split_data(data)
 
+        if len(decimals) < 9:
+            # Short packets (e.g. battery notifications) can arrive on the shared
+            # characteristic while this callback is registered. Don't crash — just
+            # wait; the 10s timeout in get_from_blind is the safety net.
+            _LOGGER.debug(
+                "%s: position_callback — packet too short (len=%d): %s — waiting for position packet",
+                self.name, len(decimals), decimals,
+            )
+            return
+
         blindPos = (decimals[7] + (256 * decimals[8])) / 10
         _LOGGER.debug("%s: Blind position is %s", self.name, blindPos)
         self._current_cover_position = blindPos
+        await _log_blind_event(self.name, "position_read", position=blindPos)
         self._moving = 0
         self._stopped_event.set()
 
@@ -809,7 +907,7 @@ class TuissBlind:
     async def send_timestamp(self) -> None:
         """Send the current timestamp command to the blind."""
         now = datetime.datetime.now()
-        timestamp_command = f"ff78ea410200{now.year - 2000:02x}{now.month:02x}{now.day:02x}{now.hour:02x}{now.minute:02x}{now.second:02x}"
+        timestamp_command = f"{CMD_TIMESTAMP_BASE}{now.year - 2000:02x}{now.month:02x}{now.day:02x}{now.hour:02x}{now.minute:02x}{now.second:02x}"
         await self.send_command(UUID, bytes.fromhex(timestamp_command))
 
     # Creates the % open/closed hex command
@@ -857,6 +955,7 @@ class TuissBlind:
                 start_position = self._current_cover_position
                 corrected_target_position = 100 - target_position
                 self._moving = movement_direction
+                await _log_blind_event(self.name, "position_command", requested=target_position, from_pos=start_position)
 
                 # Update the state and trigger the moving
                 self.publish_updates()
@@ -873,7 +972,7 @@ class TuissBlind:
                     if not skip_battery_check and self._battery_check_days and (
                         self._last_battery_check is None
                         or (
-                            (datetime.datetime.now() - self._last_battery_check).total_seconds()
+                            (dt_util.now() - self._last_battery_check).total_seconds()
                             / 86400
                         )
                         > float(self._battery_check_days)
@@ -956,10 +1055,17 @@ class TuissBlind:
                         self._attr_traversal_speed,
                     )
                     await asyncio.wait_for(self.wait_for_stop(), timeout=timeout_duration)
+                    # Movement complete — confirm final position while BLE is warm.
+                    # Battery is not re-checked here; the sync automation fires 2s later
+                    # and a concurrent get_battery_status() races on the notify characteristic.
+                    if not self._is_stopping:
+                        try:
+                            await self.get_blind_position()
+                        except Exception as e:
+                            _LOGGER.debug("%s: Post-move position query failed: %s", self.name, e)
                 except asyncio.TimeoutError:
                     _LOGGER.warning("%s: Timeout waiting for blind to stop", self.name)
                     update_task.cancel()
-                    # await self.get_blind_position()
                     await self.disconnect()
                     self.set_final_state(corrected_target_position)
                     _LOGGER.debug("%s: Lock released following timeout", self.name)
@@ -967,7 +1073,7 @@ class TuissBlind:
                     return  # stops blind updating traversal speed if it timesout
                 finally:
                     update_task.cancel()
-                    # Ensure disconnect is called in all cases
+                    # Ensure disconnect is called in all cases (no-op if post-move sync already disconnected)
                     await self.disconnect()
                     # unlock the entity to allow more changes
                     self._locked = False
@@ -987,8 +1093,11 @@ class TuissBlind:
                     self.update_traversal_speed(
                         corrected_target_position, start_position, start_time, end_time
                     )
-
-                    self.set_final_state(corrected_target_position)
+                    # Use BLE-confirmed position (_current_cover_position was updated by
+                    # get_blind_position above). Only fall back to desired target if BLE
+                    # query failed and left _current_cover_position unchanged from movement.
+                    self._moving = 0
+                    self.publish_updates()
 
         elif self._locked:
             _LOGGER.debug(
