@@ -1067,6 +1067,9 @@ class TuissBlind:
                     # Battery check is scheduled with a 12s delay so the sync_blind_position
                     # automation (fires at T+2s) has finished before we reuse the characteristic.
                     if not self._is_stopping:
+                        # Cancel dead-reckoning before the BLE position query so it
+                        # can't overwrite the confirmed position during disconnect.
+                        update_task.cancel()
                         try:
                             await self.get_blind_position()
                         except Exception as e:
