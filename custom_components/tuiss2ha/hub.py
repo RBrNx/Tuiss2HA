@@ -488,6 +488,14 @@ class TuissBlind:
         command = bytes.fromhex(CMD_BATTERY_STATUS)
         await self.get_from_blind(command, self.battery_callback)
 
+    async def _post_move_battery_check(self) -> None:
+        """Delayed battery check scheduled after a move. Runs 12s post-stop so the
+        sync_blind_position automation (T+2s) has cleared the BLE characteristic first."""
+        try:
+            await self.get_battery_status()
+        except Exception as e:
+            _LOGGER.debug("%s: Post-move battery check failed: %s", self.name, e)
+
 
     async def get_blind_position(self) -> None:
         """Get the current position of the blind."""
@@ -1056,13 +1064,16 @@ class TuissBlind:
                     )
                     await asyncio.wait_for(self.wait_for_stop(), timeout=timeout_duration)
                     # Movement complete — confirm final position while BLE is warm.
-                    # Battery is not re-checked here; the sync automation fires 2s later
-                    # and a concurrent get_battery_status() races on the notify characteristic.
+                    # Battery check is scheduled with a 12s delay so the sync_blind_position
+                    # automation (fires at T+2s) has finished before we reuse the characteristic.
                     if not self._is_stopping:
                         try:
                             await self.get_blind_position()
                         except Exception as e:
                             _LOGGER.debug("%s: Post-move position query failed: %s", self.name, e)
+                        def _schedule_battery_check(_now):
+                            self.hub._hass.async_create_task(self._post_move_battery_check())
+                        self.hub._hass.async_call_later(12, _schedule_battery_check)
                 except asyncio.TimeoutError:
                     _LOGGER.warning("%s: Timeout waiting for blind to stop", self.name)
                     update_task.cancel()
