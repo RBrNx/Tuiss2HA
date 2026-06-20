@@ -1067,16 +1067,19 @@ class TuissBlind:
                     # Battery check is scheduled with a 12s delay so the sync_blind_position
                     # automation (fires at T+2s) has finished before we reuse the characteristic.
                     if not self._is_stopping:
-                        # Cancel dead-reckoning before the BLE position query so it
-                        # can't overwrite the confirmed position during disconnect.
+                        # Cancel dead-reckoning now that movement is confirmed complete.
                         update_task.cancel()
+                        # Skip the immediate post-move BLE position query — it races with
+                        # sync_blind_position_after_movement (fires T+2s) on the same
+                        # characteristic. The sync automation handles position confirmation.
+                        # Schedule battery check at T+12s so it runs well after the sync.
                         try:
-                            await self.get_blind_position()
+                            async def _delayed_battery_check():
+                                await asyncio.sleep(12)
+                                await self._post_move_battery_check()
+                            self.hub._hass.async_create_task(_delayed_battery_check())
                         except Exception as e:
-                            _LOGGER.debug("%s: Post-move position query failed: %s", self.name, e)
-                        def _schedule_battery_check(_now):
-                            self.hub._hass.async_create_task(self._post_move_battery_check())
-                        self.hub._hass.async_call_later(12, _schedule_battery_check)
+                            _LOGGER.debug("%s: Failed to schedule delayed battery check: %s", self.name, e)
                 except asyncio.TimeoutError:
                     _LOGGER.warning("%s: Timeout waiting for blind to stop", self.name)
                     update_task.cancel()
