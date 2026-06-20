@@ -1069,17 +1069,21 @@ class TuissBlind:
                     if not self._is_stopping:
                         # Cancel dead-reckoning now that movement is confirmed complete.
                         update_task.cancel()
-                        # Skip the immediate post-move BLE position query — it races with
-                        # sync_blind_position_after_movement (fires T+2s) on the same
-                        # characteristic. The sync automation handles position confirmation.
-                        # Schedule battery check at T+12s so it runs well after the sync.
+                        # Schedule position confirmation and battery check as a background
+                        # task. T+5s gives the BLE characteristic time to clear after any
+                        # sync_blind_position automation (fires T+2s, takes 1-3s to complete).
                         try:
-                            async def _delayed_battery_check():
-                                await asyncio.sleep(12)
+                            async def _post_move_queries():
+                                await asyncio.sleep(5)
+                                try:
+                                    await self.get_blind_position()
+                                except Exception as e:
+                                    _LOGGER.debug("%s: Post-move position query failed: %s", self.name, e)
+                                await asyncio.sleep(10)
                                 await self._post_move_battery_check()
-                            self.hub._hass.async_create_task(_delayed_battery_check())
+                            self.hub._hass.async_create_task(_post_move_queries())
                         except Exception as e:
-                            _LOGGER.debug("%s: Failed to schedule delayed battery check: %s", self.name, e)
+                            _LOGGER.debug("%s: Failed to schedule post-move queries: %s", self.name, e)
                 except asyncio.TimeoutError:
                     _LOGGER.warning("%s: Timeout waiting for blind to stop", self.name)
                     update_task.cancel()
