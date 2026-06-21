@@ -976,6 +976,13 @@ class TuissBlind:
                 except asyncio.CancelledError:
                     pass
                 self._post_move_task = None
+            # Wait for any concurrent get_from_blind (dashboard poll, background read) to
+            # finish before connecting. Without this, attempt_connection() races the
+            # get_from_blind caller's establish_connection(), causing BlueZ "InProgress".
+            if self._ble_lock.locked():
+                _LOGGER.debug("%s: Waiting for concurrent BLE read to finish before movement", self.name)
+                async with self._ble_lock:
+                    pass  # acquire + release just to serialise; don't hold during movement
             await self.attempt_connection()
             if self._client and self._client.is_connected:
                 self._locked = True
