@@ -883,6 +883,17 @@ class TuissBlind:
         _LOGGER.debug("%s: Blind position is %s", self.name, blindPos)
         self._current_cover_position = blindPos
         await _log_blind_event(self.name, "position_read", position=blindPos)
+        if self._moving != 0:
+            # A concurrent position read arrived while the blind is moving (e.g. a
+            # dashboard poll queued behind the movement). Update position but don't
+            # signal stop — movement continues until set_position_callback fires near
+            # the target. Without this guard the stop event fires prematurely and
+            # wait_for_stop() returns while the blind is still physically moving.
+            _LOGGER.debug(
+                "%s: position_callback during movement — position updated, stop not signalled",
+                self.name,
+            )
+            return
         self._moving = 0
         self._stopped_event.set()
 
@@ -1067,7 +1078,11 @@ class TuissBlind:
                                 * movement_direction
                             )
                             self._current_cover_position = round(
-                                sorted([0, start_position + traversal_difference, 100])[1], 2
+                                sorted([
+                                    min(start_position, corrected_target_position),
+                                    start_position + traversal_difference,
+                                    max(start_position, corrected_target_position),
+                                ])[1], 2
                             )
                             self.publish_updates()
                             
