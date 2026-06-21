@@ -158,6 +158,13 @@ class TuissBlind:
         self._last_battery_check: datetime.datetime | None = None
         # Raw BLE battery readings for protocol analysis (capped at 100, survives until restart)
         self._battery_raw_readings: list[dict] = []
+        # Serialises all BLE reads (position + battery). Prevents adapter slot exhaustion
+        # when concurrent callers — dashboard polls, background tasks, HA services — all
+        # try to connect simultaneously. Callers queue; they never pile onto the adapter.
+        self._ble_lock = asyncio.Lock()
+        # Reference to the post-move background task so it can be cancelled when a new
+        # movement command arrives before the T+5s / T+15s queries have fired.
+        self._post_move_task: asyncio.Task | None = None
         self.timers = {}
         self._store = Store(self.hub._hass, 1, f"tuiss2ha_{self.host.replace(':', '').lower()}_schedules")
         self._limits_heartbeat_task: asyncio.Task | None = None
@@ -440,6 +447,11 @@ class TuissBlind:
     async def get_from_blind(self, command, callback) -> None:
         """Get the battery state from the blind as good or bad."""
 
+        async with self._ble_lock:
+            await self._get_from_blind_locked(command, callback)
+
+    async def _get_from_blind_locked(self, command, callback) -> None:
+        """Inner implementation — must only be called while _ble_lock is held."""
         # connect to the blind first
         await self.ensure_connected()
 
@@ -489,8 +501,7 @@ class TuissBlind:
         await self.get_from_blind(command, self.battery_callback)
 
     async def _post_move_battery_check(self) -> None:
-        """Delayed battery check scheduled after a move. Runs 12s post-stop so the
-        sync_blind_position automation (T+2s) has cleared the BLE characteristic first."""
+        """Battery check run as part of the post-move background task (T+15s after stop)."""
         try:
             await self.get_battery_status()
         except Exception as e:
@@ -499,6 +510,9 @@ class TuissBlind:
 
     async def get_blind_position(self) -> None:
         """Get the current position of the blind."""
+        if self._locked:
+            _LOGGER.debug("%s: Skipping position query — movement in progress", self.name)
+            return
         await _log_blind_event(self.name, "position_query")
         command = bytes.fromhex(INITIALIZATION_MESSAGE)
         await self.get_from_blind(command, self.position_callback)
@@ -805,9 +819,7 @@ class TuissBlind:
     async def battery_callback(self, sender: BleakGATTCharacteristic, data: bytearray):
         """Wait for response from the blind and updates entity status."""
         decimals = self.split_data(data)
-        # WARNING so raw bytes are always visible in HA's log — helps build a
-        # dataset to understand the BLE protocol across firmware/charge states.
-        _LOGGER.warning("%s: battery_callback raw decimals (len=%d): %s", self.name, len(decimals), decimals)
+        _LOGGER.debug("%s: battery_callback raw decimals (len=%d): %s", self.name, len(decimals), decimals)
 
         # Record every invocation regardless of discriminator match, for analysis.
         matched = len(decimals) > 4 and decimals[4] in (2, 210)
@@ -955,6 +967,15 @@ class TuissBlind:
         """Move the cover."""
         _LOGGER.debug("%s: Entering async_move_cover. Locked: %s", self.name, self._locked)
         if not self._locked:
+            # Cancel any background position/battery task from the previous move so it
+            # doesn't race the BLE operations we're about to start.
+            if self._post_move_task and not self._post_move_task.done():
+                self._post_move_task.cancel()
+                try:
+                    await self._post_move_task
+                except asyncio.CancelledError:
+                    pass
+                self._post_move_task = None
             await self.attempt_connection()
             if self._client and self._client.is_connected:
                 self._locked = True
@@ -1074,14 +1095,17 @@ class TuissBlind:
                         # sync_blind_position automation (fires T+2s, takes 1-3s to complete).
                         try:
                             async def _post_move_queries():
-                                await asyncio.sleep(5)
                                 try:
-                                    await self.get_blind_position()
-                                except Exception as e:
-                                    _LOGGER.debug("%s: Post-move position query failed: %s", self.name, e)
-                                await asyncio.sleep(10)
-                                await self._post_move_battery_check()
-                            self.hub._hass.async_create_task(_post_move_queries())
+                                    await asyncio.sleep(5)
+                                    try:
+                                        await self.get_blind_position()
+                                    except Exception as e:
+                                        _LOGGER.debug("%s: Post-move position query failed: %s", self.name, e)
+                                    await asyncio.sleep(10)
+                                    await self._post_move_battery_check()
+                                except asyncio.CancelledError:
+                                    _LOGGER.debug("%s: Post-move queries cancelled — new command received", self.name)
+                            self._post_move_task = self.hub._hass.async_create_task(_post_move_queries())
                         except Exception as e:
                             _LOGGER.debug("%s: Failed to schedule post-move queries: %s", self.name, e)
                 except asyncio.TimeoutError:
