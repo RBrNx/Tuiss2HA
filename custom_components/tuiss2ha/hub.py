@@ -255,6 +255,7 @@ class TuissBlind:
 
             # If the client is connected, return early
             if self._client and self._client.is_connected:
+                self._last_connection_error = None  # clear stale error so sensor state stays short
                 await _log_blind_event(self.name, "connection_success", attempt=retry_count)
                 return
 
