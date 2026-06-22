@@ -325,6 +325,12 @@ class TuissBlind:
             self._limits_heartbeat_task.cancel()
             self._limits_heartbeat_task = None
 
+        # Don't disconnect while a move is in progress — the move owns the BLE connection.
+        # The move releases _locked before calling disconnect itself (see async_move_cover).
+        if self._locked:
+            _LOGGER.debug("%s: Skipping BLE disconnect — move is in progress", self.name)
+            return
+
         client = self._client
         if not client:
             _LOGGER.debug("%s: Already disconnected", self.name)
@@ -465,6 +471,12 @@ class TuissBlind:
         """Inner implementation — must only be called while _ble_lock is held."""
         # connect to the blind first
         await self.ensure_connected()
+
+        # If a move started while we were connecting, bail — the move owns _client and
+        # registering notifications here would overwrite set_position_callback.
+        if self._locked:
+            _LOGGER.debug("%s: Blind locked for movement — aborting concurrent BLE read", self.name)
+            return
 
         assert self._client is not None
         notify_started = False
@@ -1052,23 +1064,37 @@ class TuissBlind:
                     # Defensive: don't let battery-check logic break movement
                     _LOGGER.debug("%s: Error while evaluating battery check timing", self.name)
                 
-                try:
-                    # Timeout on set_position to prevent hanging indefinitely
-                    await asyncio.wait_for(self.set_position(target_position), timeout=30.0)
-                except asyncio.TimeoutError:
-                    _LOGGER.error("%s: set_position() timed out after 30s. Unsticking blind.", self.name)
-                    self._moving = 0
-                    self._locked = False
-                    self.publish_updates()
-                    await self.disconnect()
-                    return
-                except Exception as e:
-                    _LOGGER.error("%s: Failed to send move command: %s. Unsticking blind.", self.name, e)
-                    # Command failed; unstick the blind immediately
-                    self._moving = 0
-                    self._locked = False
-                    self.publish_updates()
-                    await self.disconnect()
+                move_sent = False
+                for _attempt in range(2):
+                    try:
+                        # Timeout on set_position to prevent hanging indefinitely
+                        await asyncio.wait_for(self.set_position(target_position), timeout=30.0)
+                        move_sent = True
+                        break
+                    except asyncio.TimeoutError:
+                        _LOGGER.error("%s: set_position() timed out after 30s. Unsticking blind.", self.name)
+                        self._moving = 0
+                        self._locked = False
+                        self.publish_updates()
+                        await self.disconnect()
+                        return
+                    except Exception as e:
+                        if _attempt == 0 and 'NotConnected' in str(e):
+                            # BLE link dropped silently — disconnect to clear stale client
+                            # and let ensure_connected() re-establish on the next attempt.
+                            _LOGGER.warning(
+                                "%s: Move command got NotConnected — reconnecting and retrying.",
+                                self.name,
+                            )
+                            await self.disconnect()
+                            continue
+                        _LOGGER.error("%s: Failed to send move command: %s. Unsticking blind.", self.name, e)
+                        self._moving = 0
+                        self._locked = False
+                        self.publish_updates()
+                        await self.disconnect()
+                        return
+                if not move_sent:
                     return
                 
                 end_time = None
@@ -1147,17 +1173,16 @@ class TuissBlind:
                 except asyncio.TimeoutError:
                     _LOGGER.warning("%s: Timeout waiting for blind to stop", self.name)
                     update_task.cancel()
+                    self._locked = False  # Release before disconnect so disconnect() isn't skipped
                     await self.disconnect()
                     self.set_final_state(corrected_target_position)
                     _LOGGER.debug("%s: Lock released following timeout", self.name)
-                    self._locked = False
                     return  # stops blind updating traversal speed if it timesout
                 finally:
                     update_task.cancel()
+                    self._locked = False  # Release before disconnect so disconnect() isn't skipped
                     # Ensure disconnect is called in all cases (no-op if post-move sync already disconnected)
                     await self.disconnect()
-                    # unlock the entity to allow more changes
-                    self._locked = False
                     _LOGGER.debug("%s: Lock released in async_move_cover.", self.name)
 
                 # set the traversal speed average and update final states only if the blind has not been stopped, as that updates itself
