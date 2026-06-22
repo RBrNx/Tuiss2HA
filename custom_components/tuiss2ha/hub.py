@@ -379,7 +379,10 @@ class TuissBlind:
                 BLIND_NOTIFY_CHARACTERISTIC, self.set_position_callback
             )
         except BleakError:
-            await self._client.stop_notify(BLIND_NOTIFY_CHARACTERISTIC)
+            try:
+                await self._client.stop_notify(BLIND_NOTIFY_CHARACTERISTIC)
+            except BleakError:
+                pass  # no prior notify session on this connection — that's fine
             await self._client.start_notify(
                 BLIND_NOTIFY_CHARACTERISTIC, self.set_position_callback
             )
