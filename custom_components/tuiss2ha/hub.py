@@ -162,6 +162,10 @@ class TuissBlind:
         # when concurrent callers — dashboard polls, background tasks, HA services — all
         # try to connect simultaneously. Callers queue; they never pile onto the adapter.
         self._ble_lock = asyncio.Lock()
+        # Tracks whether we have an active BLE notify subscription. Reset to False on
+        # every new connection and every disconnect. Used to guard stop_notify calls so
+        # we only attempt to stop a session we know is registered.
+        self._notify_registered = False
         # Reference to the post-move background task so it can be cancelled when a new
         # movement command arrives before the T+5s / T+15s queries have fired.
         self._post_move_task: asyncio.Task | None = None
@@ -293,6 +297,7 @@ class TuissBlind:
                 ble_device_callback=lambda: device,
             )
             self._client = client
+            self._notify_registered = False  # fresh connection has no subscriptions
             # send the maintain connection message
             await self._client.write_gatt_char(UUID, bytes.fromhex(CONNECTION_MESSAGE))
 
@@ -332,6 +337,8 @@ class TuissBlind:
             except Exception as notify_ex:
                 # Characteristic might not exist or notifications not started
                 _LOGGER.debug("%s: Could not stop notifications: %s", self.name, notify_ex)
+            finally:
+                self._notify_registered = False
             await client.disconnect()
         except BLEAK_RETRY_EXCEPTIONS as ex:
             _LOGGER.warning(
@@ -378,14 +385,15 @@ class TuissBlind:
             await self._client.start_notify(
                 BLIND_NOTIFY_CHARACTERISTIC, self.set_position_callback
             )
+            self._notify_registered = True
         except BleakError:
-            try:
+            if self._notify_registered:
                 await self._client.stop_notify(BLIND_NOTIFY_CHARACTERISTIC)
-            except BleakError:
-                pass  # no prior notify session on this connection — that's fine
+                self._notify_registered = False
             await self._client.start_notify(
                 BLIND_NOTIFY_CHARACTERISTIC, self.set_position_callback
             )
+            self._notify_registered = True
         await self.send_command(UUID, command)  # send the command
 
     async def stop(self) -> None:
@@ -463,13 +471,16 @@ class TuissBlind:
         try:
             await self._client.start_notify(BLIND_NOTIFY_CHARACTERISTIC, callback)
             notify_started = True
+            self._notify_registered = True
         except BleakError as e:
             _LOGGER.debug("%s: Failed to start notify: %s. Attempting to stop and restart.", self.name, e)
             try:
                 # when need to overwrite the existing notification
                 await self._client.stop_notify(BLIND_NOTIFY_CHARACTERISTIC)
+                self._notify_registered = False
                 await self._client.start_notify(BLIND_NOTIFY_CHARACTERISTIC, callback)
                 notify_started = True
+                self._notify_registered = True
             except BleakError as retry_error:
                 _LOGGER.warning("%s: Could not establish notifications: %s", self.name, retry_error)
                 await self.disconnect()
