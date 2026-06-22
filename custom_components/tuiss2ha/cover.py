@@ -319,6 +319,7 @@ class Tuiss(CoverEntity, RestoreEntity):
             ATTR_TRAVERSAL_SPEED: self._blind._attr_traversal_speed,
             ATTR_MAC_ADDRESS: self._attr_mac_address,
             "timers": list(self._blind.timers.values()),
+            "current_position_precise": self._blind._current_cover_position,
         }
 
     @property
