@@ -844,7 +844,11 @@ class TuissBlind:
     ##################################################################################################
 
     async def battery_callback(self, sender: BleakGATTCharacteristic, data: bytearray):
-        """Wait for response from the blind and updates entity status."""
+        """Wait for response from the blind and updates entity status.
+
+        NOTE: Same duplicate-packet behaviour as position_callback — two identical
+        packets arrive within ~60ms. Second fire is benign for the same reasons.
+        """
         decimals = self.split_data(data)
         _LOGGER.debug("%s: battery_callback raw decimals (len=%d): %s", self.name, len(decimals), decimals)
 
@@ -891,7 +895,15 @@ class TuissBlind:
             )
 
     async def position_callback(self, sender: BleakGATTCharacteristic, data: bytearray):
-        """Wait for response from the blind and updates entity status."""
+        """Wait for response from the blind and updates entity status.
+
+        NOTE: Tuiss firmware sends duplicate BLE notify packets for the same read —
+        two identical packets arrive within ~60ms of each other. This is normal firmware
+        behaviour and results in this callback firing twice per position query. The second
+        fire is benign: _current_cover_position is overwritten with the same value,
+        _stopped_event.set() is a no-op (already set), and publish_updates() fires once
+        more. Not worth deduplicating given the negligible cost.
+        """
         _LOGGER.debug("%s: Attempting to get position", self.name)
 
         decimals = self.split_data(data)
