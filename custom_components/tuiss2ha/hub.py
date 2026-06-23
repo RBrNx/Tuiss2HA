@@ -1188,7 +1188,20 @@ class TuissBlind:
                     update_task.cancel()
                     self._locked = False  # Release before disconnect so disconnect() isn't skipped
                     await self.disconnect()
-                    self.set_final_state(corrected_target_position)
+                    # Don't assume the blind reached the target — it may not have moved at
+                    # all (BLE failure, firmware no-op). Setting state to the target would
+                    # corrupt _current_cover_position and cause the next command to compute
+                    # zero travel distance and a 10-second timeout. Query actual position
+                    # instead so state reflects reality.
+                    self._moving = 0
+                    self.publish_updates()
+                    async def _query_after_timeout():
+                        await asyncio.sleep(3)
+                        try:
+                            await self.get_blind_position()
+                        except Exception as e:
+                            _LOGGER.debug("%s: Post-timeout position query failed: %s", self.name, e)
+                    self._post_move_task = self.hub._hass.async_create_task(_query_after_timeout())
                     _LOGGER.debug("%s: Lock released following timeout", self.name)
                     return  # stops blind updating traversal speed if it timesout
                 finally:
