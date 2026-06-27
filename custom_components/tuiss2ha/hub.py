@@ -189,6 +189,13 @@ class TuissBlind:
 
             # If the client is connected, return early
             if self._client and self._client.is_connected:
+                # Passive BLE scan callback only fires once per integration reload — read RSSI
+                # from the scanner here so the sensor stays current on every blind operation.
+                service_info = bluetooth.async_last_service_info(
+                    self.hub._hass, self.host, connectable=False
+                )
+                if service_info is not None:
+                    self.set_rssi(service_info.rssi)
                 return
 
             retry_count += 1
