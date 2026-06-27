@@ -327,7 +327,7 @@ class Tuiss(CoverEntity, RestoreEntity):
         """Return the current position of the cover."""
         if self._blind._current_cover_position is None:
             return None
-        return int(self._blind._current_cover_position)
+        return round(self._blind._current_cover_position)
 
     @property
     def is_closed(self) -> bool | None:
