@@ -51,6 +51,8 @@ _LOGGER = logging.getLogger(__name__)
 
 
 ATTR_TRAVERSAL_SPEED = "traversal_speed"
+ATTR_TRAVERSAL_SPEED_OPEN = "traversal_speed_open"
+ATTR_TRAVERSAL_SPEED_CLOSE = "traversal_speed_close"
 ATTR_MAC_ADDRESS = "mac_address"
 
 GET_BLIND_POSITION_SCHEMA = cv.make_entity_service_schema({})
@@ -317,6 +319,8 @@ class Tuiss(CoverEntity, RestoreEntity):
         """Attributes for the traversal time of the blinds."""
         return {
             ATTR_TRAVERSAL_SPEED: self._blind._attr_traversal_speed,
+            ATTR_TRAVERSAL_SPEED_OPEN: self._blind._attr_traversal_speed_open,
+            ATTR_TRAVERSAL_SPEED_CLOSE: self._blind._attr_traversal_speed_close,
             ATTR_MAC_ADDRESS: self._attr_mac_address,
             "timers": list(self._blind.timers.values()),
             "current_position_precise": self._blind._current_cover_position,
@@ -368,6 +372,10 @@ class Tuiss(CoverEntity, RestoreEntity):
             )
         if last_state and last_state.attributes.get(ATTR_TRAVERSAL_SPEED) is not None:
             self._blind._attr_traversal_speed = last_state.attributes.get(ATTR_TRAVERSAL_SPEED)
+        if last_state and last_state.attributes.get(ATTR_TRAVERSAL_SPEED_OPEN) is not None:
+            self._blind._attr_traversal_speed_open = last_state.attributes.get(ATTR_TRAVERSAL_SPEED_OPEN)
+        if last_state and last_state.attributes.get(ATTR_TRAVERSAL_SPEED_CLOSE) is not None:
+            self._blind._attr_traversal_speed_close = last_state.attributes.get(ATTR_TRAVERSAL_SPEED_CLOSE)
         
         self._blind.register_callback(self.update_state)
 

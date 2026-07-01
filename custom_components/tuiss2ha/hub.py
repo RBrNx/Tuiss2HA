@@ -152,6 +152,8 @@ class TuissBlind:
         self._blind_speed: str | None = None
         self._locked = False
         self._attr_traversal_speed: float | None = None
+        self._attr_traversal_speed_open: float | None = None
+        self._attr_traversal_speed_close: float | None = None
         self._last_connection_error: str | None = None  # For logging when connection fails
         # Battery check configuration
         self._battery_check_days: int = 0
@@ -1128,18 +1130,23 @@ class TuissBlind:
                 async def aync_update_position_in_realtime():
                     """Task to update the position while the blind is moving."""
                     while self._client and self._client.is_connected and not self._is_stopping:
-                        if self._attr_traversal_speed is not None:
+                        effective_speed = (
+                            self._attr_traversal_speed_open if movement_direction == 1
+                            else self._attr_traversal_speed_close
+                        ) or self._attr_traversal_speed
+                        if effective_speed is not None:
                             _LOGGER.debug(
-                                "%s: StartPos: %s. CurrentPos: %s. TargetPos: %s. Timedelta: %s",
+                                "%s: StartPos: %s. CurrentPos: %s. TargetPos: %s. Timedelta: %s. Speed (dir): %s",
                                 self.name,
                                 start_position,
                                 self._current_cover_position,
                                 corrected_target_position,
                                 (datetime.datetime.now() - start_time).total_seconds(),
+                                effective_speed,
                             )
                             traversal_difference = (
                                 (datetime.datetime.now() - start_time).total_seconds()
-                                * self._attr_traversal_speed
+                                * effective_speed
                                 * movement_direction
                             )
                             self._current_cover_position = round(
@@ -1157,18 +1164,22 @@ class TuissBlind:
 
                 try:
                     # Calculate timeout based on traversal speed or use default
-                    if (self._attr_traversal_speed is not None and 
-                        self._attr_traversal_speed >= 1 and 
-                        self._attr_traversal_speed < 6):
-                        timeout_duration = ((abs(corrected_target_position - start_position) * 1.2) / self._attr_traversal_speed) + 10
+                    timeout_speed = (
+                        self._attr_traversal_speed_open if movement_direction == 1
+                        else self._attr_traversal_speed_close
+                    ) or self._attr_traversal_speed
+                    if (timeout_speed is not None and timeout_speed >= 1 and timeout_speed < 6):
+                        timeout_duration = ((abs(corrected_target_position - start_position) * 1.2) / timeout_speed) + 10
                     else:
                         timeout_duration = TIMEOUT_SECONDS or 120
                     
                     _LOGGER.debug(
-                        "%s: Waiting for stop event with timeout: %s seconds. Traversal speed: %s",
+                        "%s: Waiting for stop event with timeout: %s seconds. Speed: combined=%s open=%s close=%s",
                         self.name,
                         timeout_duration,
                         self._attr_traversal_speed,
+                        self._attr_traversal_speed_open,
+                        self._attr_traversal_speed_close,
                     )
                     await asyncio.wait_for(self.wait_for_stop(), timeout=timeout_duration)
                     # Movement complete — confirm final position while BLE is warm.
@@ -1235,7 +1246,7 @@ class TuissBlind:
                 if not self._is_stopping:
                     end_time = datetime.datetime.now()
                     self.update_traversal_speed(
-                        corrected_target_position, start_position, start_time, end_time
+                        corrected_target_position, start_position, start_time, end_time, movement_direction
                     )
                     # Use BLE-confirmed position (_current_cover_position was updated by
                     # get_blind_position above). Only fall back to desired target if BLE
@@ -1256,21 +1267,36 @@ class TuissBlind:
                     "name": self.name,
                 })
 
-    def update_traversal_speed(self, target_position, start_position, start_time, end_time):
-        """Update the traversal speed."""
+    def update_traversal_speed(self, target_position, start_position, start_time, end_time, movement_direction):
+        """Update the traversal speed, tracking open and close rates separately via EMA."""
         time_taken = (end_time - start_time).total_seconds()
         traversal_distance = abs(target_position - start_position)
         # Only update traversal speed if the blind has moved a significant distance to avoid skewing from small movements or noise
         if traversal_distance > TRAVERSAL_UPDATE_THRESHOLD:
-            self._attr_traversal_speed = traversal_distance / time_taken
+            speed = traversal_distance / time_taken
+            # Direction-specific EMA (alpha=0.3 — weights recent readings, smooths outliers)
+            if movement_direction == 1:  # opening
+                self._attr_traversal_speed_open = (
+                    speed if self._attr_traversal_speed_open is None
+                    else 0.7 * self._attr_traversal_speed_open + 0.3 * speed
+                )
+            else:  # closing
+                self._attr_traversal_speed_close = (
+                    speed if self._attr_traversal_speed_close is None
+                    else 0.7 * self._attr_traversal_speed_close + 0.3 * speed
+                )
+            # Combined speed: latest raw measurement (backward compat fallback)
+            self._attr_traversal_speed = speed
             _LOGGER.debug(
-                "%s: Time Taken: %s. Start Pos: %s. End Pos: %s. Distance Travelled: %s. Traversal Speed: %s",
+                "%s: Time Taken: %s. Start Pos: %s. End Pos: %s. Distance Travelled: %s. Speed raw: %s open: %s close: %s",
                 self.name,
                 time_taken,
                 start_position,
                 target_position,
                 traversal_distance,
-                self._attr_traversal_speed,
+                speed,
+                self._attr_traversal_speed_open,
+                self._attr_traversal_speed_close,
             )
         
     def set_final_state(self, position):
