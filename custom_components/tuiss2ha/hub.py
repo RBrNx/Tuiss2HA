@@ -259,10 +259,17 @@ class TuissBlind:
             if self._client and self._client.is_connected:
                 self._last_connection_error = None  # clear stale error so sensor state stays short
                 connection_rssi = getattr(self._client, 'rssi', None)
+                # connectable=True reads from the same manager history
+                # (_connectable_history) that async_ble_device_from_address used
+                # to pick self._ble_device for this connection. connectable=False
+                # pulls from the merged all-scanner history, which can surface a
+                # passive-only scanner's advert that has nothing to do with the
+                # scanner that actually made the connection.
                 service_info = bluetooth.async_last_service_info(
-                    self.hub._hass, self.host, connectable=False
+                    self.hub._hass, self.host, connectable=True
                 )
                 scan_rssi = service_info.rssi if service_info is not None else None
+                scan_source = service_info.source if service_info is not None else None
                 rssi = connection_rssi if connection_rssi is not None else scan_rssi
                 if rssi is not None:
                     self.set_rssi(rssi)
@@ -270,6 +277,7 @@ class TuissBlind:
                     self.name, "connection_success",
                     attempt=retry_count, rssi=rssi,
                     connection_rssi=connection_rssi, scan_rssi=scan_rssi,
+                    scan_source=scan_source,
                 )
                 return
 
