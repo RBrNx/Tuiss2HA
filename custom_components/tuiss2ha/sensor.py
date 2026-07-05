@@ -244,6 +244,12 @@ class TuissSignalSensor(SensorEntity):
         """Return the state of the sensor."""
         return self.blind.rssi
 
+    @property
+    def extra_state_attributes(self) -> dict[str, str] | None:
+        """Return the scanner (adapter/proxy MAC) that reported this rssi."""
+        source = self.blind.rssi_source
+        return {"source": source} if source is not None else None
+
     async def async_added_to_hass(self) -> None:
         """Register callbacks."""
         self.blind.register_callback(self._handle_update)

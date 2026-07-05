@@ -112,7 +112,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     ) -> None:
         """Update RSSI on device discovery."""
         if adv := service_info.advertisement:
-            hub.blinds[0].set_rssi(adv.rssi)
+            hub.blinds[0].set_rssi(adv.rssi, source=service_info.source)
 
     entry.async_on_unload(
         async_register_callback(

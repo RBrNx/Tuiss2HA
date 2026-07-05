@@ -138,6 +138,7 @@ class TuissBlind:
             )
         self.model = self._ble_device.name if self._ble_device else None
         self._rssi: int | None = None
+        self._rssi_source: str | None = None
         self._client: BleakClientWithServiceCache | None = None
         self._callbacks = set()
         self._battery_status = False
@@ -186,11 +187,17 @@ class TuissBlind:
         """Return the rssi for the blind."""
         return self._rssi
 
-    def set_rssi(self, rssi: int) -> None:
-        """Update the RSSI for the blind."""
-        if self._rssi == rssi:
+    @property
+    def rssi_source(self) -> str | None:
+        """Return the scanner (adapter/proxy MAC) that reported the current rssi."""
+        return self._rssi_source
+
+    def set_rssi(self, rssi: int, source: str | None = None) -> None:
+        """Update the RSSI (and the scanner source that reported it) for the blind."""
+        if self._rssi == rssi and self._rssi_source == source:
             return
         self._rssi = rssi
+        self._rssi_source = source
         self.publish_updates()
 
     def publish_updates(self) -> None:
@@ -271,8 +278,9 @@ class TuissBlind:
                 scan_rssi = service_info.rssi if service_info is not None else None
                 scan_source = service_info.source if service_info is not None else None
                 rssi = connection_rssi if connection_rssi is not None else scan_rssi
+                rssi_source = "client" if connection_rssi is not None else scan_source
                 if rssi is not None:
-                    self.set_rssi(rssi)
+                    self.set_rssi(rssi, source=rssi_source)
                 await _log_blind_event(
                     self.name, "connection_success",
                     attempt=retry_count, rssi=rssi,
