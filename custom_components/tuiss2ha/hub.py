@@ -175,6 +175,13 @@ class TuissBlind:
         self.timers = {}
         self._store = Store(self.hub._hass, 1, f"tuiss2ha_{self.host.replace(':', '').lower()}_schedules")
         self._limits_heartbeat_task: asyncio.Task | None = None
+        # HA-side named position presets (separate from firmware timers).
+        self.presets: dict[str, float] = {}
+        self._presets_store = Store(
+            self.hub._hass,
+            1,
+            f"tuiss2ha_{self.host.replace(':', '').lower()}_presets",
+        )
 
 
     @property
@@ -191,6 +198,11 @@ class TuissBlind:
     def rssi_source(self) -> str | None:
         """Return the scanner (adapter/proxy MAC) that reported the current rssi."""
         return self._rssi_source
+
+    @property
+    def current_position(self) -> float | None:
+        """Return the last observed cover position (0-100), or None if unknown."""
+        return self._current_cover_position
 
     def set_rssi(self, rssi: int, source: str | None = None) -> None:
         """Update the RSSI (and the scanner source that reported it) for the blind."""
@@ -342,10 +354,10 @@ class TuissBlind:
                 self._moving,
             )
         except (BleakError, asyncio.TimeoutError) as e:
-            self._last_connection_error = str(e)
+            self._last_connection_error = f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: {e}"
             _LOGGER.debug("Failed to connect to blind: %s", e)
         except Exception as e:
-            self._last_connection_error = f"{type(e).__name__}: {e}"
+            self._last_connection_error = f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: {type(e).__name__}: {e}"
             _LOGGER.debug("%s: Unexpected error during connect: %s", self.name, e)
 
     # Disconnect
@@ -464,6 +476,8 @@ class TuissBlind:
             case "Slow":
                 command = bytes.fromhex(CMD_SPEED_SLOW)
             case _:
+                # Defensive: caller should validate, but never let an unset
+                # or unrecognised speed value raise UnboundLocalError below.
                 _LOGGER.warning(
                     "%s: Cannot set speed — unrecognised value %r",
                     self.name,
@@ -633,7 +647,7 @@ class TuissBlind:
             _LOGGER.debug("Connection lost, limits set up failed")
         
         _LOGGER.debug("Stepping up")
-        await self.send_command(UUID, bytes.fromhex(CMD_LIMITS_STEP_UP))    
+        await self.send_command(UUID, bytes.fromhex(CMD_LIMITS_STEP_UP))
         
 
     async def limits_step_down(self) -> None:
@@ -680,15 +694,15 @@ class TuissBlind:
         
         _LOGGER.debug("Stopping movement")
         await self.send_command(UUID, bytes.fromhex(CMD_STOP))
-        
-        
+
+
     async def limits_set(self) -> None:
         """Sets the limit."""
         self.limits_heartbeat_stop()
         # Connect to the blind first
         if not self._client or not self._client.is_connected:
             _LOGGER.debug("Connection lost, limits set up failed")
-        
+
         _LOGGER.debug("Setting the limit")
         await self.send_command(UUID, bytes.fromhex(CMD_STOP))
         await self.send_command(UUID, bytes.fromhex(CMD_LIMITS_SET))
@@ -708,6 +722,116 @@ class TuissBlind:
     async def async_save_timer(self) -> None:
         """Save schedules to storage."""
         await self._store.async_save(self.timers)
+
+
+    async def async_load_presets(self) -> None:
+        """Load stored position presets; fall back to empty on corruption."""
+        try:
+            stored = await self._presets_store.async_load()
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning(
+                "%s: Failed to load presets from storage (%s); starting empty",
+                self.name, exc,
+            )
+            self.presets = {}
+            return
+        if stored and isinstance(stored, dict):
+            clean: dict[str, float] = {}
+            for name, position in stored.items():
+                if not isinstance(name, str) or not name.strip():
+                    _LOGGER.warning(
+                        "%s: Dropping preset with invalid name %r",
+                        self.name, name,
+                    )
+                    continue
+                try:
+                    pos_f = float(position)
+                except (TypeError, ValueError):
+                    _LOGGER.warning(
+                        "%s: Dropping preset %r with invalid position %r",
+                        self.name, name, position,
+                    )
+                    continue
+                if not 0 <= pos_f <= 100:
+                    _LOGGER.warning(
+                        "%s: Dropping preset %r with out-of-range position %s",
+                        self.name, name, pos_f,
+                    )
+                    continue
+                clean[name] = pos_f
+            self.presets = clean
+            # Re-persist if we dropped anything so the next restart is clean.
+            if len(clean) != len(stored):
+                await self._presets_store.async_save(clean)
+        else:
+            self.presets = {}
+
+    async def async_save_presets(self) -> None:
+        """Persist position presets to storage."""
+        await self._presets_store.async_save(self.presets)
+
+    async def async_apply_preset(self, name: str) -> None:
+        """Move the blind to the position stored under ``name``.
+
+        Dispatches directly to ``async_move_cover`` to bypass HA's
+        ``cover.set_cover_position`` int-coercion and preserve 0.1%
+        precision end-to-end. Refuses when the live position is unknown
+        rather than guessing a direction.
+        """
+        if name not in self.presets:
+            raise HomeAssistantError(
+                f"{self.name}: preset {name!r} not found"
+            )
+        position = float(self.presets[name])
+        current = self._current_cover_position
+        if current is None:
+            raise HomeAssistantError(
+                f"{self.name}: preset {name!r} cannot apply — current "
+                "position is unknown. Move the blind once so its "
+                "position is read, then try again."
+            )
+        movement_direction = 1 if current <= position else -1
+        try:
+            await self.async_move_cover(
+                movement_direction=movement_direction,
+                target_position=100 - position,
+            )
+        except (ConnectionTimeout, DeviceNotFound, HomeAssistantError) as e:
+            raise HomeAssistantError(
+                f"{self.name}: preset {name!r} failed to apply: {e}"
+            ) from e
+        _LOGGER.info(
+            "%s: Applied preset %r -> %s%%", self.name, name, position
+        )
+
+    async def async_save_current_as_preset(self, name: str) -> float | None:
+        """Save the live cover position under ``name``.
+
+        Returns the stored float, or None if position has never been read.
+        Raises ValueError on empty/non-string names.
+        """
+        if not isinstance(name, str):
+            raise ValueError("preset name must be a string")
+        name = name.strip()
+        if not name:
+            raise ValueError("preset name cannot be empty or whitespace only")
+        current = self._current_cover_position
+        if current is None:
+            _LOGGER.warning(
+                "%s: Cannot save preset %r — current position is unknown",
+                self.name, name,
+            )
+            return None
+        # Clamp against transient out-of-range frames.
+        position = max(0.0, min(100.0, float(current)))
+        self.presets[name] = position
+        await self.async_save_presets()
+        self.publish_updates()
+        _LOGGER.info(
+            "%s: Saved preset %r at current position %s%%",
+            self.name, name, position,
+        )
+        return position
 
 
     async def async_add_timer(self, days: list[str], time_str: str, position: float) -> str:
@@ -733,7 +857,7 @@ class TuissBlind:
 
         await self.send_command(UUID, bytes.fromhex(CONNECTION_MESSAGE))   
         await self.send_timestamp()   
-        await self.send_command(UUID, bytes.fromhex(CMD_TIMER_REQUEST))   
+        await self.send_command(UUID, bytes.fromhex(CMD_TIMER_REQUEST))
         
         try:
             await asyncio.wait_for(timer_id_event.wait(), timeout=10.0)
@@ -763,9 +887,9 @@ class TuissBlind:
         timer_id = new_timer_id
         timer_command = self.create_timer_command(timer_id, days, time_str, position)
         
-        await self.send_command(UUID, bytes.fromhex(timer_command))   
+        await self.send_command(UUID, bytes.fromhex(timer_command))
         await self.send_command(UUID, bytes.fromhex(CMD_BATTERY_STATUS))
-        await self.disconnect()       
+        await self.disconnect()
         
         existing_ha_indices = {t.get("ha_index") for t in self.timers.values() if "ha_index" in t}
         available_indices = set(range(1, 17)) - existing_ha_indices
@@ -815,9 +939,9 @@ class TuissBlind:
         await self.send_timestamp()
         await self.send_command(UUID, bytes.fromhex(INITIALIZATION_MESSAGE))
         await self.send_command(UUID, bytes.fromhex(CMD_TIMER_RESET)) # reset command
-        
+
         await self.disconnect()
-        
+
         # Reconnect to the blind to ensure it's back online after reset
         await self.attempt_connection()
         await self.send_command(UUID, bytes.fromhex(CMD_BLIND_REACTIVATE)) # reactivate blind
