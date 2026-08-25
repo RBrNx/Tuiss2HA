@@ -883,7 +883,11 @@ class TuissBlind:
         _LOGGER.debug("%s: battery_callback raw decimals (len=%d): %s", self.name, len(decimals), decimals)
 
         # Record every invocation regardless of discriminator match, for analysis.
-        matched = len(decimals) > 4 and decimals[4] in (2, 210)
+        # Only 210 (0xD2) is the real battery-status response — a generic ack (seen
+        # with d4=2) arrives first on this shared characteristic and was previously
+        # accepted here too, which resolved the wait on the ack before the real
+        # packet had a chance to arrive.
+        matched = len(decimals) > 4 and decimals[4] == 210
         reading = {
             "ts": dt_util.now().isoformat(),
             "data": decimals,
@@ -915,13 +919,19 @@ class TuissBlind:
                 low=self._battery_status,
                 d4=decimals[4] if len(decimals) > 4 else None,
                 d5=decimals[5] if len(decimals) > 5 else None,
+                raw=decimals,
             )
             self._stopped_event.set()
         else:
             _LOGGER.debug(
-                "%s: battery_callback — decimals[4]=%s not in known discriminators (2, 210); skipping parse",
+                "%s: battery_callback — decimals[4]=%s is not 210; skipping parse",
                 self.name,
                 decimals[4] if len(decimals) > 4 else "N/A",
+            )
+            await _log_blind_event(
+                self.name, "battery_read_unmatched",
+                d4=decimals[4] if len(decimals) > 4 else None,
+                raw=decimals,
             )
 
     async def position_callback(self, sender: BleakGATTCharacteristic, data: bytearray):
@@ -978,10 +988,16 @@ class TuissBlind:
             blindPos = decimals[6]
             self._current_cover_position = blindPos
             self.publish_updates()
-            
+
             if self._desired_position is not None and abs(blindPos - self._desired_position) <= 2:
                 _LOGGER.debug("%s: Reached desired position. Stopping wait.", self.name)
                 self._stopped_event.set()
+        else:
+            await _log_blind_event(
+                self.name, "move_callback_unmatched",
+                d4=decimals[4] if len(decimals) > 4 else None,
+                raw=decimals,
+            )
 
     ##################################################################################################
     ## DATA METHODS ############################################################################
