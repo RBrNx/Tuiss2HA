@@ -821,7 +821,12 @@ class TuissBlind:
         decimals = self.split_data(data)
         _LOGGER.debug("%s: battery_callback raw decimals (len=%d): %s", self.name, len(decimals), decimals)
 
-        matched = len(decimals) > 4 and decimals[4] in (2, 210)
+        # Only 210 (0xD2) is the real battery-status response — a generic ack (seen
+        # with decimals[4]=2) arrives first on this shared characteristic. Matching
+        # on it too resolves the wait before the real packet has a chance to arrive,
+        # so the reported battery level ends up permanently stuck on whatever the
+        # ack's fixed bytes happen to decode to, regardless of actual charge state.
+        matched = len(decimals) > 4 and decimals[4] == 210
 
         if matched:
             if len(decimals) < 6:
@@ -841,7 +846,7 @@ class TuissBlind:
             self._stopped_event.set()
         else:
             _LOGGER.debug(
-                "%s: battery_callback — decimals[4]=%s not in known discriminators (2, 210); skipping parse",
+                "%s: battery_callback — decimals[4]=%s is not 210; skipping parse",
                 self.name,
                 decimals[4] if len(decimals) > 4 else "N/A",
             )
