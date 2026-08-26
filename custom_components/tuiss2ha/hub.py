@@ -1045,6 +1045,16 @@ class TuissBlind:
                 d5=decimals[5] if len(decimals) > 5 else None,
                 raw=decimals,
             )
+            # Every other state-mutating callback in this file publishes right after
+            # changing something — this one didn't, so a battery reading only ever
+            # reached the binary_sensor entity when some unrelated later call to
+            # publish_updates() happened to flush the already-mutated value. The
+            # post-move battery check (T+15s) is the last step of its background
+            # task with nothing after it, so that path silently never updated HA at
+            # all — confirmed live: 4 consecutive correct "not low" reads over 2026-08-25/26
+            # went unpublished while binary_sensor.blind_1_battery stayed stuck on
+            # the last value that happened to get flushed.
+            self.publish_updates()
             self._stopped_event.set()
         else:
             _LOGGER.debug(
