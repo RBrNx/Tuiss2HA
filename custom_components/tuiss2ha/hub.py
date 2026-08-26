@@ -836,6 +836,14 @@ class TuissBlind:
                 self._last_battery_check = dt_util.now()
             except Exception:
                 self._last_battery_check = None
+            # Every other state-mutating callback in this file publishes right after
+            # changing something — this one didn't, so a battery reading only ever
+            # reached the binary_sensor entity when some unrelated later call to
+            # publish_updates() happened to flush the already-mutated value. The
+            # post-move battery check (T+15s) is the last step of its background
+            # task with nothing after it, so that path silently never updated HA at
+            # all.
+            self.publish_updates()
             self._stopped_event.set()
         else:
             _LOGGER.debug(
