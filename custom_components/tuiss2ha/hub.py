@@ -913,7 +913,7 @@ class TuissBlind:
         decimals = self.split_data(data)
         _LOGGER.debug("%s: battery_callback raw decimals (len=%d): %s", self.name, len(decimals), decimals)
 
-        matched = len(decimals) > 4 and decimals[4] in (2, 210)
+        matched = len(decimals) > 4 and decimals[4] == (210)
 
         if matched:
             if len(decimals) < 6:
