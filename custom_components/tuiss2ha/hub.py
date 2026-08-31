@@ -490,13 +490,6 @@ class TuissBlind:
         command = bytes.fromhex(CMD_BATTERY_STATUS)
         await self.get_from_blind(command, self.battery_callback)
 
-    async def _post_move_battery_check(self) -> None:
-        """Battery check run as part of the post-move background task (T+15s after stop)."""
-        try:
-            await self.get_battery_status()
-        except Exception as e:
-            _LOGGER.debug("%s: Post-move battery check failed: %s", self.name, e)
-
 
     async def get_blind_position(self) -> None:
         """Get the current position of the blind."""
@@ -1085,14 +1078,18 @@ class TuissBlind:
                     )
                     await asyncio.wait_for(self.wait_for_stop(), timeout=timeout_duration)
                     # Movement complete — confirm final position while BLE is warm.
-                    # Battery check is scheduled with a 12s delay so the sync_blind_position
-                    # automation (fires at T+2s) has finished before we reuse the characteristic.
                     if not self._is_stopping:
                         # Cancel dead-reckoning now that movement is confirmed complete.
                         update_task.cancel()
-                        # Schedule position confirmation and battery check as a background
-                        # task. T+5s gives the BLE characteristic time to clear after any
-                        # sync_blind_position automation (fires T+2s, takes 1-3s to complete).
+                        # Schedule position confirmation as a background task. T+5s gives
+                        # the BLE characteristic time to clear after any sync_blind_position
+                        # automation (fires T+2s, takes 1-3s to complete).
+                        #
+                        # No automatic battery check here (previously ran at T+15s) — checking
+                        # battery jolts the blind's mechanism, and doing so after every single
+                        # move drifts its calibrated physical stop-limits over time. Battery is
+                        # still checked, just not tied to movement — see the manual
+                        # get_battery_status service / options already provided.
                         try:
                             async def _post_move_queries():
                                 try:
@@ -1101,8 +1098,6 @@ class TuissBlind:
                                         await self.get_blind_position()
                                     except Exception as e:
                                         _LOGGER.debug("%s: Post-move position query failed: %s", self.name, e)
-                                    await asyncio.sleep(10)
-                                    await self._post_move_battery_check()
                                 except asyncio.CancelledError:
                                     _LOGGER.debug("%s: Post-move queries cancelled — new command received", self.name)
                             self._post_move_task = self.hub._hass.async_create_task(_post_move_queries())
