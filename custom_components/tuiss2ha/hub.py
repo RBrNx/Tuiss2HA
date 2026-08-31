@@ -571,8 +571,35 @@ class TuissBlind:
         command = bytes.fromhex(CMD_BATTERY_STATUS)
         await self.get_from_blind(command, self.battery_callback)
 
-    async def _post_move_battery_check(self) -> None:
-        """Battery check run as part of the post-move background task (T+15s after stop)."""
+    def _battery_check_due(self) -> bool:
+        """True once _battery_check_days have elapsed since the last real check.
+
+        Single gate shared by every automatic battery-check trigger — there
+        used to be a separate copy of this same condition run unconditionally
+        before every move too, which meant the blind's battery got queried
+        (and, per upstream reports, its mechanism nudged) on every single
+        movement rather than at the configured interval. Consolidating onto
+        one gate, checked from the post-move background task instead of
+        inline before the move command, means a battery check still happens
+        automatically without holding up the move itself, but no more often
+        than _battery_check_days actually calls for.
+        """
+        if not self._battery_check_days:
+            return False
+        if self._last_battery_check is None:
+            return True
+        age_days = (dt_util.now() - self._last_battery_check).total_seconds() / 86400
+        return age_days > float(self._battery_check_days)
+
+    async def _post_move_battery_check(self, skip_battery_check: bool = False) -> None:
+        """Battery check run as part of the post-move background task (T+15s after stop).
+
+        Only actually queries the blind if a check is due per
+        _battery_check_due() — see its own docstring for why this replaced
+        the old unconditional pre-move check.
+        """
+        if skip_battery_check or not self._battery_check_due():
+            return
         try:
             await self.get_battery_status()
         except Exception as e:
@@ -1225,38 +1252,8 @@ class TuissBlind:
 
                 # Update the state and trigger the moving
                 self.publish_updates()
-                
-                _LOGGER.debug(
-                            "%s: Battery check age (%s days). Last check: %s.",
-                            self.name,
-                            self._battery_check_days,
-                            self._last_battery_check,
-                        )
-                
-                # Perform a battery check before moving if configured
-                try:
-                    if not skip_battery_check and self._battery_check_days and (
-                        self._last_battery_check is None
-                        or (
-                            (dt_util.now() - self._last_battery_check).total_seconds()
-                            / 86400
-                        )
-                        > float(self._battery_check_days)
-                    ):
-                        _LOGGER.debug(
-                            "%s: Battery check age exceeded (%s days). Checking battery.",
-                            self.name,
-                            self._battery_check_days,
-                        )
-                        # It's OK if this fails — we still proceed with the movement
-                        try:
-                            await self.get_battery_status()
-                        except Exception as e:
-                            _LOGGER.debug("%s: Battery check failed: %s", self.name, e)
-                except Exception:
-                    # Defensive: don't let battery-check logic break movement
-                    _LOGGER.debug("%s: Error while evaluating battery check timing", self.name)
-                
+
+
                 move_sent = False
                 for _attempt in range(2):
                     try:
@@ -1366,7 +1363,7 @@ class TuissBlind:
                                     except Exception as e:
                                         _LOGGER.debug("%s: Post-move position query failed: %s", self.name, e)
                                     await asyncio.sleep(10)
-                                    await self._post_move_battery_check()
+                                    await self._post_move_battery_check(skip_battery_check)
                                 except asyncio.CancelledError:
                                     _LOGGER.debug("%s: Post-move queries cancelled — new command received", self.name)
                             self._post_move_task = self.hub._hass.async_create_task(_post_move_queries())
